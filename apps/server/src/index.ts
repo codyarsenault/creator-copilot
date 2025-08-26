@@ -3,7 +3,6 @@ import express, { type Request, type Response } from "express";
 import cors from "cors";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
-import { ideaFactory } from "./ideaFactory.js";
 import OpenAI from "openai";
 
 const prisma = new PrismaClient();
@@ -27,7 +26,7 @@ function safeParseJson<T = unknown>(val: unknown): T | unknown {
 }
 
 async function generateIdeasWithLLM(input: { niche: string; tone: string; goals: string[]; pillars: string[] }) {
-  if (!openai) return ideaFactory(input);
+  if (!openai) throw new Error("LLM not configured");
   const { niche, tone, goals, pillars } = input;
   const prompt = `You are an expert short-form content strategist for creators. Generate 5 concise, high-signal video ideas tailored to the user's niche, tone, goals, and content pillars.
 
@@ -60,7 +59,7 @@ Context:
 - pillars: ${pillars.join(", ") || "—"}`;
 
   try {
-    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 12000);
+    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 30000);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const completion = await openai.chat.completions.create({
@@ -100,10 +99,9 @@ Context:
       pillar: String(idea.pillar ?? (pillars.length ? ` • Pillar: ${pillars[0]}` : ""))
     }));
   } catch (err) {
-    // Fallback to local generator on any error
-    const message = (err as any)?.name === 'AbortError' ? `timeout after ${process.env.OPENAI_TIMEOUT_MS || 12000}ms` : (err as Error)?.message ?? err;
-    console.log("[ideas] LLM error or unavailable, falling back to local generator:", message);
-    return ideaFactory(input);
+    const message = (err as any)?.name === 'AbortError' ? `timeout after ${process.env.OPENAI_TIMEOUT_MS || 30000}ms` : (err as Error)?.message ?? err;
+    console.log("[ideas] LLM error:", message);
+    throw err;
   }
 }
 
@@ -121,8 +119,21 @@ app.post("/api/ideas", async (req: Request, res: Response) => {
 
   const { niche, tone, goals, pillars, userId } = parsed.data;
 
-  // Prefer LLM when available, otherwise fall back to local factory
-  const ideas = await generateIdeasWithLLM({ niche, tone, goals, pillars });
+  if (!openai) return res.status(503).json({ error: "llm_unavailable" });
+  let ideas: any[];
+  try {
+    ideas = await generateIdeasWithLLM({ niche, tone, goals, pillars });
+  } catch (e) {
+    return res.status(502).json({ error: "llm_failed" });
+  }
+  // De-duplicate by hook
+  const seen = new Set<string>();
+  ideas = ideas.filter(i => {
+    const k = (i.hook || "").trim().toLowerCase();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 
   const records = await Promise.all(ideas.map(idea =>
     prisma.idea.create({

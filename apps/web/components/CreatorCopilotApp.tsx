@@ -226,6 +226,16 @@ const IdeaCard = ({ idea, onCopy }: IdeaCardProps) => (
         ))}
       </ul>
     </div>
+    <div className="mt-3 text-xs">
+      <a
+        href={`https://www.tiktok.com/search?q=${encodeURIComponent(idea.hook)}`}
+        target="_blank"
+        rel="noreferrer"
+        className="underline text-indigo-600 hover:text-indigo-700"
+      >
+        See similar on TikTok
+      </a>
+    </div>
   </div>
 );
 
@@ -247,7 +257,7 @@ export default function CreatorCopilotApp() {
   const SERVER_URL =
     (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_SERVER_URL) ||
     (typeof window !== "undefined" && (window as any).SERVER_URL) ||
-    "";
+    "http://localhost:4000"; // sane default for local dev
 
   const DEV_TOKEN_KEY = "cc_dev_token";
 
@@ -308,9 +318,8 @@ export default function CreatorCopilotApp() {
         setServerTried(true);
       }
     }
-    // Fallback to local generation
-    const data = ideaFactory({ niche: activeNiche, tone, goals, pillars });
-    setIdeas(data);
+    // No local fallback; mark server as unreachable
+    setServerOK(false);
     setLoading(false);
   };
 
@@ -366,7 +375,7 @@ TIPS:
             <h1 className="text-2xl font-bold tracking-tight flex items-center gap-2"><Sparkles className="text-indigo-600" /> Creator Co‑Pilot</h1>
             <p className="text-sm text-gray-600">Know what to post, how to improve, and grow faster — personalized to your niche.</p>
             {serverTried && (
-              <p className={classNames("mt-1 text-xs", serverOK ? "text-green-600" : "text-amber-600")}>{serverOK ? "Connected to server API" : "Server API not reachable — using local generator"}</p>
+              <p className={classNames("mt-1 text-xs", serverOK ? "text-green-600" : "text-amber-600")}>{serverOK ? "Connected to server API" : "Server API not reachable"}</p>
             )}
           </div>
           <div className="hidden md:flex gap-3">
