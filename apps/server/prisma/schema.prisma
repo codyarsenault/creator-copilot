@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String?  @unique
+  name      String?
+  createdAt DateTime @default(now())
+  ideas     Idea[]
+  tiktok    TikTokAccount[]
+}
+
+model Idea {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  niche     String
+  tone      String
+  goals     String
+  pillars   String
+  hook      String
+  caption   String
+  hashtags  String
+  outline   String
+  cta       String
+  tips      String
+  createdAt DateTime @default(now())
+}
+
+model TikTokAccount {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  tiktokUserId  String
+  username      String?
+  accessToken   String
+  refreshToken  String?
+  expiresAt     DateTime?
+  scope         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+}
