@@ -28,7 +28,29 @@ function safeParseJson<T = unknown>(val: unknown): T | unknown {
 async function generateIdeasWithLLM(input: { niche: string; tone: string; goals: string[]; pillars: string[] }) {
   if (!openai) throw new Error("LLM not configured");
   const { niche, tone, goals, pillars } = input;
-  const prompt = `You are an expert short-form content strategist for creators. Generate 5 concise, high-signal video ideas tailored to the user's niche, tone, goals, and content pillars.
+  const goalDirectives: Record<string, string[]> = {
+    followers: [
+      "Hook must be broad/relatable; prioritize shareability",
+      "Clear CTA to follow for part 2 or series",
+    ],
+    engagement: [
+      "Include a comment bait or question",
+      "Prompt stitches/duets where relevant",
+    ],
+    consistency: [
+      "Ideas should be easy to batch and film in under 30 minutes",
+      "Prefer repeatable formats/templates",
+    ],
+    monetize: [
+      "Each idea must include a clear revenue path (product, service, affiliate, lead magnet, newsletter, course)",
+      "CTA must reference link in bio or specific offer",
+      "If no product, propose a free lead magnet to capture emails",
+    ],
+  };
+  const activeDirectives = goals.flatMap(g => goalDirectives[g] ?? []);
+  const directivesText = activeDirectives.length ? `\nGoal directives:\n- ${activeDirectives.join("\n- ")}` : "";
+
+  const prompt = `You are an expert short-form content strategist for creators. Generate 5 concise, high-signal video ideas tailored to the user's niche, tone, goals, and content pillars.${directivesText}
 
 Return ONLY strict JSON with the following shape:
 {
@@ -51,6 +73,7 @@ Rules:
 - outline must be 4–6 short beats.
 - hashtags must be 3–6 items and each begins with #.
 - pillar can be an empty string or one of the provided pillars.
+ - If goals include "monetize": each idea must include a monetization angle in the hook or caption, and the CTA must reference a revenue path (product, service, affiliate, sponsor, lead magnet, course, or newsletter sign-up).
 
 Context:
 - niche: ${niche}
@@ -68,11 +91,27 @@ Context:
         { role: "system", content: "You produce actionable content ideas and only respond with JSON when asked." },
         { role: "user", content: prompt }
       ],
-      temperature: 0.7
+      temperature: 0.7,
+      response_format: { type: "json_object" }
     }, { signal: controller.signal, timeout: timeoutMs });
     clearTimeout(timeout);
     const text = completion.choices?.[0]?.message?.content?.trim() || "";
-    const parsed = JSON.parse(text);
+    // Be defensive: strip code fences or surrounding text, extract JSON object/array
+    let raw = text;
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) raw = fenced[1].trim();
+    if (!fenced) {
+      const start = raw.search(/[\[{]/);
+      const end = Math.max(raw.lastIndexOf("}"), raw.lastIndexOf("]"));
+      if (start >= 0 && end > start) raw = raw.slice(start, end + 1);
+    }
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.error("[ideas] JSON parse failed", { preview: raw.slice(0, 200) });
+      throw e;
+    }
     const ideas = Array.isArray(parsed) ? parsed : parsed.ideas;
     if (!Array.isArray(ideas)) throw new Error("Malformed LLM response");
 
@@ -97,7 +136,15 @@ Context:
         "Use captions; 70% watch muted",
       ]).map((t: any) => String(t)).slice(0, 6),
       pillar: String(idea.pillar ?? (pillars.length ? ` • Pillar: ${pillars[0]}` : ""))
-    }));
+    })).map((i: any) => {
+      if (goals.includes("monetize")) {
+        const monetized = /(link in bio|shop|buy|free|download|guide|newsletter|course|join|apply|book|signup|sign up|promo|code|store|merch|patreon|sponsor)/i.test(i.cta || "");
+        if (!monetized) {
+          i.cta = "Check link in bio for free guide/product; follow for part 2";
+        }
+      }
+      return i;
+    });
   } catch (err) {
     const message = (err as any)?.name === 'AbortError' ? `timeout after ${process.env.OPENAI_TIMEOUT_MS || 30000}ms` : (err as Error)?.message ?? err;
     console.log("[ideas] LLM error:", message);
@@ -472,6 +519,71 @@ function registerTikTokAuth() {
       });
     } catch (e) {
       console.error("[tiktok] analysis error", e);
+      return res.status(500).json({ error: "unexpected" });
+    }
+  });
+
+  // Task suggestions derived from recent performance and optional follower delta
+  app.get("/api/tasks", async (req: Request, res: Response) => {
+    const userId = (req.query.userId as string) || "";
+    const followerDelta = Number((req.query.followerDelta as string) || 0);
+    const acct = await prisma.tikTokAccount.findFirst({ where: { userId }, orderBy: { updatedAt: "desc" } });
+    if (!acct) return res.status(404).json({ error: "Not connected" });
+    if (!TIKTOK_CLIENT_ID || !TIKTOK_CLIENT_SECRET) {
+      return res.json({ tasks: [
+        { id: "stub-1", title: "Post 3 videos this week", priority: "high", reason: "Build consistency", action: "Block two 30‑minute batching sessions" },
+        { id: "stub-2", title: "Tighten hooks to 3–5 words on screen by 0.2s", priority: "med", reason: "Improve hook retention", action: "Add high‑contrast text preset" }
+      ]});
+    }
+
+    try {
+      // Reuse analysis data
+      const apiUrl = "https://open.tiktokapis.com/v2/video/list/";
+      const requestedFields = "id,title,create_time,duration";
+      const urlWithFields = `${apiUrl}?fields=${encodeURIComponent(requestedFields)}`;
+      const resp = await fetch(urlWithFields, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${acct.accessToken}`,
+          "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+          Accept: "application/json"
+        },
+        body: new URLSearchParams({ max_count: String(20) })
+      });
+      const data: any = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        console.error("[tiktok] video.list for tasks failed", { status: resp.status, body: data });
+        return res.status(502).json({ error: "tiktok_api", status: resp.status });
+      }
+      const videosRaw: any[] = data?.data?.videos || [];
+      const videos = videosRaw.map((v: any) => ({
+        id: v.id || v.video_id,
+        title: v.title || v.description || "",
+        createdAt: v.create_time ? new Date(Number(v.create_time) * 1000) : null,
+        durationSec: v.duration || null,
+      })).filter((v: any) => v.createdAt);
+
+      const total = videos.length;
+      const durations = videos.map(v => Number(v.durationSec || 0)).filter(n => n > 0).sort((a,b)=>a-b);
+      const medianDurationSec = durations.length ? durations[Math.floor(durations.length/2)] : 0;
+      const days = videos.map(v => v.createdAt!.getTime()).sort((a,b)=>a-b);
+      const daysCovered = days.length ? Math.max(1, Math.ceil((days[days.length-1]-days[0])/(1000*60*60*24))) : 0;
+      const cadencePerWeek = daysCovered ? Number(((total / daysCovered) * 7).toFixed(2)) : 0;
+      const byHour: Record<string, number> = {}; for (let i=0;i<24;i++) byHour[String(i)] = 0; videos.forEach(v=>{ byHour[String(v.createdAt!.getHours())]++; });
+      const bestHours = Object.entries(byHour).sort((a,b)=>b[1]-a[1]).slice(0,2).map(([h])=>Number(h));
+
+      // Build tasks
+      const tasks: Array<{id:string; title:string; priority:"high"|"med"|"low"; reason:string; action:string}> = [];
+      if (cadencePerWeek < 3) tasks.push({ id: "cadence", title: "Post at least 3 times per week", priority: "high", reason: `Current cadence ~${cadencePerWeek}/week`, action: "Batch record 2 sessions (30 min) and schedule" });
+      if (medianDurationSec > 35) tasks.push({ id: "length-down", title: "Trim videos toward 20–30s", priority: "med", reason: `Median length ${medianDurationSec}s`, action: "Cut set‑up; show payoff by 5–7s" });
+      if (medianDurationSec > 0 && medianDurationSec < 15) tasks.push({ id: "length-up", title: "Add one visual step to increase watch time", priority: "med", reason: `Median ${medianDurationSec}s`, action: "Insert a quick demo between hook and payoff" });
+      if (bestHours.length) tasks.push({ id: "timing", title: `Schedule posts around ${bestHours.map(h=>`${h}:00`).join(', ')}`, priority: "low", reason: "Audience active windows", action: "Use reminders to post at peak hours" });
+      if (followerDelta < 0) tasks.push({ id: "followers-down", title: "Run 3 hook experiments this week", priority: "high", reason: `Followers −${Math.abs(followerDelta)}`, action: "Test question hook, contrarian take, and transformation promise" });
+      if (followerDelta > 0 && followerDelta < 50) tasks.push({ id: "followers-flat", title: "Double‑down on best theme with 2‑part series", priority: "med", reason: `Followers +${followerDelta}`, action: "Re‑use top format and vary topic angle" });
+
+      return res.json({ tasks });
+    } catch (e) {
+      console.error("[tasks] error", e);
       return res.status(500).json({ error: "unexpected" });
     }
   });

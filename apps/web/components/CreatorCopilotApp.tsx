@@ -18,6 +18,14 @@ type Idea = {
   pillar: string;
 };
 
+type Task = {
+  id: string;
+  title: string;
+  priority: "high" | "med" | "low";
+  reason: string;
+  action: string;
+};
+
 const NICHES = [
   "Fitness",
   "Parenting",
@@ -251,22 +259,39 @@ export default function CreatorCopilotApp() {
   const [serverTried, setServerTried] = useState<boolean>(false);
   const [serverOK, setServerOK] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [tasksLoading, setTasksLoading] = useState<boolean>(false);
+  const [followerDelta, setFollowerDelta] = useState<number>(0);
+  const [tasksError, setTasksError] = useState<string | null>(null);
 
   const activeNiche = customNiche.trim() || niche;
 
-  const SERVER_URL =
+  const DEFAULT_SERVER =
     (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_SERVER_URL) ||
     (typeof window !== "undefined" && (window as any).SERVER_URL) ||
     "http://localhost:4000"; // sane default for local dev
+  const [serverUrl, setServerUrl] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return window.localStorage.getItem('cc_server_url') || DEFAULT_SERVER;
+    }
+    return DEFAULT_SERVER;
+  });
+  React.useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem('cc_server_url', serverUrl);
+    }
+  }, [serverUrl]);
 
   const DEV_TOKEN_KEY = "cc_dev_token";
 
   const ensureDevToken = async () => {
-    if (!SERVER_URL) return null;
+    if (!serverUrl) return null;
     try {
       let token = typeof window !== "undefined" ? window.localStorage.getItem(DEV_TOKEN_KEY) : null;
       if (!token) {
-        const res = await fetch(`${SERVER_URL.replace(/\/$/, '')}/api/auth/dev-login`, { method: 'POST' });
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (/ngrok/.test(serverUrl)) headers['ngrok-skip-browser-warning'] = 'true';
+        const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/dev-login`, { method: 'POST', headers });
         if (res.ok) {
           const data = await res.json();
           token = data?.token || null;
@@ -293,12 +318,14 @@ export default function CreatorCopilotApp() {
     if (loading) return;
     setLoading(true);
     // Try server first
-    if (SERVER_URL) {
+    if (serverUrl) {
       try {
         const token = await ensureDevToken();
-        const res = await fetch(`${SERVER_URL.replace(/\/$/, '')}/api/ideas`, {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (/ngrok/.test(serverUrl)) headers['ngrok-skip-browser-warning'] = 'true';
+        const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/ideas`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({ niche: activeNiche, tone, goals, pillars, userId: token || undefined })
         });
         if (res.ok) {
@@ -346,6 +373,41 @@ TIPS:
     } catch {}
   };
 
+  const refreshTasks = async () => {
+    try {
+      setTasksLoading(true);
+      const token = await ensureDevToken();
+      if (!serverUrl || !token) {
+        setTasks([]);
+        setTasksLoading(false);
+        return;
+      }
+      const qs = new URLSearchParams({ userId: token, followerDelta: String(followerDelta || 0) });
+      const headers: Record<string, string> = {};
+      if (/ngrok/.test(serverUrl)) headers['ngrok-skip-browser-warning'] = 'true';
+      const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/tasks?${qs.toString()}`, { headers });
+      const data = await res.json();
+      if (Array.isArray(data.tasks)) {
+        setTasksError(null);
+        setTasks(data.tasks);
+      } else {
+        setTasks([]);
+        setTasksError(data?.error ? String(data.error) : `Server returned status ${res.status}`);
+      }
+    } catch {
+      setTasks([]);
+      setTasksError("Failed to load tasks");
+    } finally {
+      setTasksLoading(false);
+    }
+  };
+
+  React.useEffect(() => {
+    // Autoload tasks when mounting or serverUrl changes
+    refreshTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverUrl]);
+
 
   // Primitive "video feedback" form (no real video analysis in-browser)
   const [vf, setVf] = useState({ length: 23, captions: true, trendingSound: false, firstTextSec: 1, cuts: 10 });
@@ -390,11 +452,17 @@ TIPS:
             <h3 className="font-semibold mb-3 flex items-center gap-2"><LinkIcon size={18} /> Connect TikTok</h3>
             <div className="space-y-3">
               <Toggle label="TikTok" checked={platforms.tiktok} onChange={(v) => handleTikTokToggle(v)} />
+              <div className="text-xs">
+                <label className="flex items-center gap-2">
+                  <span>Server URL</span>
+                  <input value={serverUrl} onChange={(e)=>setServerUrl(e.target.value)} className="px-2 py-1 rounded-lg border w-full" placeholder="http://localhost:4000" />
+                </label>
+              </div>
               <button
                 onClick={async () => {
                   const token = await ensureDevToken();
-                  if (!SERVER_URL) return;
-                  const base = `${SERVER_URL.replace(/\/$/, '')}/auth/tiktok/start`;
+                  if (!serverUrl) return;
+                  const base = `${serverUrl.replace(/\/$/, '')}/auth/tiktok/start`;
                   const qs = new URLSearchParams();
                   if (token) qs.set('userId', token);
                   // Request minimal permitted scope by default; add more once approved
@@ -502,6 +570,40 @@ TIPS:
               <IdeaCard key={idea.id} idea={idea} onCopy={onCopy} />
             ))
           )}
+        </section>
+
+        {/* Tasks */}
+        <section className="mt-6 grid lg:grid-cols-2 gap-5">
+          <div className="rounded-2xl border p-4 bg-white/70">
+            <h3 className="font-semibold mb-2">Tasks</h3>
+            <div className="flex items-center gap-2 text-sm">
+              <label className="flex items-center gap-2">
+                <span>Follower delta</span>
+                <input type="number" value={followerDelta} onChange={(e)=>setFollowerDelta(Number(e.target.value||0))} className="w-24 px-2 py-1 rounded-lg border"/>
+              </label>
+              <button onClick={refreshTasks} className="px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50">Refresh</button>
+            </div>
+            {tasksLoading ? (
+              <p className="text-sm text-gray-600 mt-3">Loading tasks…</p>
+            ) : tasksError ? (
+              <p className="text-sm text-amber-700 mt-3">{tasksError === 'Not connected' ? 'Connect TikTok first, then Refresh.' : tasksError === 'tiktok_api' ? 'TikTok API error (check scopes and reconnect), then Refresh.' : tasksError}</p>
+            ) : tasks.length === 0 ? (
+              <p className="text-sm text-gray-600 mt-3">No tasks yet. Click Refresh.</p>
+            ) : (
+              <ul className="mt-3 space-y-2">
+                {tasks.map(t => (
+                  <li key={t.id} className="rounded-xl border p-3 bg-white/80">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-medium text-sm">{t.title}</div>
+                      <span className={`text-xs px-2 py-0.5 rounded-full border ${t.priority==='high'?'bg-red-50 text-red-700 border-red-200':t.priority==='med'?'bg-amber-50 text-amber-700 border-amber-200':'bg-green-50 text-green-700 border-green-200'}`}>{t.priority}</span>
+                    </div>
+                    <div className="text-xs text-gray-600 mt-1">Reason: {t.reason}</div>
+                    <div className="text-xs mt-1"><span className="text-gray-600">Action:</span> {t.action}</div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </section>
 
         {/* Video feedback */}
