@@ -14,6 +14,7 @@ model User {
   createdAt DateTime @default(now())
   ideas     Idea[]
   tiktok    TikTokAccount[]
+  snapshots TikTokSnapshot[]
 }
 
 model Idea {
@@ -47,4 +48,14 @@ model TikTokAccount {
   updatedAt     DateTime @updatedAt
 
   @@index([userId])
+}
+
+model TikTokSnapshot {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  followerCount Int
+  capturedAt    DateTime @default(now())
+
+  @@index([userId, capturedAt])
 }

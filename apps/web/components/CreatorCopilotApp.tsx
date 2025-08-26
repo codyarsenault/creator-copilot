@@ -26,6 +26,8 @@ type Task = {
   action: string;
 };
 
+type TrendItem = { tag?: string; score: number; title?: string; url?: string };
+
 const NICHES = [
   "Fitness",
   "Parenting",
@@ -261,8 +263,10 @@ export default function CreatorCopilotApp() {
   const [loading, setLoading] = useState<boolean>(false);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState<boolean>(false);
-  const [followerDelta, setFollowerDelta] = useState<number>(0);
+  const [deltas, setDeltas] = useState<{day:number;week:number;month:number} | null>(null);
   const [tasksError, setTasksError] = useState<string | null>(null);
+  const [trends, setTrends] = useState<{ hashtags: TrendItem[]; sounds: TrendItem[]; date?: string } | null>(null);
+  const [trendsLoading, setTrendsLoading] = useState<boolean>(false);
 
   const activeNiche = customNiche.trim() || niche;
 
@@ -382,7 +386,7 @@ TIPS:
         setTasksLoading(false);
         return;
       }
-      const qs = new URLSearchParams({ userId: token, followerDelta: String(followerDelta || 0) });
+      const qs = new URLSearchParams({ userId: token });
       const headers: Record<string, string> = {};
       if (/ngrok/.test(serverUrl)) headers['ngrok-skip-browser-warning'] = 'true';
       const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/tasks?${qs.toString()}`, { headers });
@@ -390,6 +394,7 @@ TIPS:
       if (Array.isArray(data.tasks)) {
         setTasksError(null);
         setTasks(data.tasks);
+        if (data?.deltas) setDeltas(data.deltas);
       } else {
         setTasks([]);
         setTasksError(data?.error ? String(data.error) : `Server returned status ${res.status}`);
@@ -399,6 +404,22 @@ TIPS:
       setTasksError("Failed to load tasks");
     } finally {
       setTasksLoading(false);
+    }
+  };
+
+  const refreshTrends = async () => {
+    try {
+      setTrendsLoading(true);
+      const headers: Record<string, string> = {};
+      if (/ngrok/.test(serverUrl)) headers['ngrok-skip-browser-warning'] = 'true';
+      const qs = new URLSearchParams({ niche: activeNiche });
+      const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/trends?${qs.toString()}`, { headers });
+      const data = await res.json();
+      if (data?.hashtags && data?.sounds) setTrends({ hashtags: data.hashtags, sounds: data.sounds, date: data.date });
+    } catch {
+      setTrends(null);
+    } finally {
+      setTrendsLoading(false);
     }
   };
 
@@ -576,12 +597,15 @@ TIPS:
         <section className="mt-6 grid lg:grid-cols-2 gap-5">
           <div className="rounded-2xl border p-4 bg-white/70">
             <h3 className="font-semibold mb-2">Tasks</h3>
-            <div className="flex items-center gap-2 text-sm">
-              <label className="flex items-center gap-2">
-                <span>Follower delta</span>
-                <input type="number" value={followerDelta} onChange={(e)=>setFollowerDelta(Number(e.target.value||0))} className="w-24 px-2 py-1 rounded-lg border"/>
-              </label>
+            <div className="flex items-center gap-3 text-sm">
               <button onClick={refreshTasks} className="px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50">Refresh</button>
+              {deltas ? (
+                <div className="flex items-center gap-2 text-xs text-gray-600">
+                  <span>Δ1d: {deltas.day >=0 ? '+' : ''}{deltas.day}</span>
+                  <span>Δ7d: {deltas.week >=0 ? '+' : ''}{deltas.week}</span>
+                  <span>Δ30d: {deltas.month >=0 ? '+' : ''}{deltas.month}</span>
+                </div>
+              ) : null}
             </div>
             {tasksLoading ? (
               <p className="text-sm text-gray-600 mt-3">Loading tasks…</p>
@@ -602,6 +626,43 @@ TIPS:
                   </li>
                 ))}
               </ul>
+            )}
+          </div>
+          <div className="rounded-2xl border p-4 bg-white/70">
+            <h3 className="font-semibold mb-2">Today’s trends</h3>
+            <div className="flex items-center gap-2 text-sm">
+              <button onClick={refreshTrends} className="px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50">Refresh</button>
+              {trends?.date ? <span className="text-xs text-gray-500">{trends.date}</span> : null}
+            </div>
+            {trendsLoading ? (
+              <p className="text-sm text-gray-600 mt-3">Loading trends…</p>
+            ) : !trends ? (
+              <p className="text-sm text-gray-600 mt-3">Click Refresh to load niche hashtags and sounds.</p>
+            ) : (
+              <div className="grid sm:grid-cols-2 gap-3 mt-3">
+                <div>
+                  <div className="text-xs font-medium mb-1">Hashtags</div>
+                  <ul className="space-y-1 text-sm">
+                    {trends.hashtags.map((h, i) => (
+                      <li key={i} className="flex items-center justify-between gap-2">
+                        <a href={`https://www.tiktok.com/tag/${encodeURIComponent(h.tag?.replace('#','') || '')}`} target="_blank" rel="noreferrer" className="underline">{h.tag}</a>
+                        <span className="text-xs text-gray-500">{h.score}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <div className="text-xs font-medium mb-1">Sounds</div>
+                  <ul className="space-y-1 text-sm">
+                    {trends.sounds.map((s, i) => (
+                      <li key={i} className="flex items-center justify-between gap-2">
+                        <span>{s.title}</span>
+                        <span className="text-xs text-gray-500">{s.score}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
             )}
           </div>
         </section>

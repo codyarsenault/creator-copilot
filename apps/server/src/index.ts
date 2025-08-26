@@ -342,8 +342,9 @@ function registerTikTokAuth() {
         return res.status(502).json({ ok: false, error: "TikTok token response incomplete" });
       }
 
-      // Optional: fetch basic user info for username
+      // Optional: fetch basic user info for username + followerCount
       let username: string | undefined = undefined;
+      let followerCount: number | undefined = undefined;
       try {
         const infoResp = await fetch("https://open.tiktokapis.com/v2/user/info/", {
           method: "GET",
@@ -352,6 +353,7 @@ function registerTikTokAuth() {
         const infoJson: any = await infoResp.json().catch(() => ({}));
         if (infoResp.ok) {
           username = infoJson?.data?.user?.display_name || infoJson?.data?.user?.username;
+          followerCount = infoJson?.data?.user?.follower_count ?? undefined;
         }
       } catch {}
 
@@ -367,6 +369,9 @@ function registerTikTokAuth() {
           scope: scopeGranted
         }
       });
+      if (typeof followerCount === 'number') {
+        await prisma.tikTokSnapshot.create({ data: { userId: ensuredUserId, followerCount } });
+      }
       res.json({ ok: true, platform: "tiktok", connected: true, account: acct });
     } catch (e) {
       console.error("[tiktok] callback failed", e);
@@ -395,7 +400,8 @@ function registerTikTokAuth() {
 
     try {
       const apiUrl = "https://open.tiktokapis.com/v2/video/list/";
-      const requestedFields = "id,title,create_time,duration";
+      // Try to ask for public performance fields; API will ignore unknowns
+      const requestedFields = "id,title,create_time,duration,play_count,like_count,comment_count,share_count";
       const urlWithFields = `${apiUrl}?fields=${encodeURIComponent(requestedFields)}`;
       const resp = await fetch(urlWithFields, {
         method: "POST",
@@ -458,11 +464,13 @@ function registerTikTokAuth() {
         return res.status(502).json({ error: "tiktok_api", status: resp.status });
       }
       const videosRaw: any[] = data?.data?.videos || [];
-      const videos = videosRaw.map((v: any) => ({
+      const videos: Array<{id:any; title:string; createdAt: Date|null; durationSec: number|null; views?: number|null; likes?: number|null}> = videosRaw.map((v: any) => ({
         id: v.id || v.video_id,
         title: v.title || v.description || "",
         createdAt: v.create_time ? new Date(Number(v.create_time) * 1000) : null,
         durationSec: v.duration || null,
+        views: v.play_count ?? v.statistics?.play_count ?? null,
+        likes: v.like_count ?? v.statistics?.like_count ?? null,
       })).filter((v: any) => v.createdAt);
 
       const total = videos.length;
@@ -526,7 +534,15 @@ function registerTikTokAuth() {
   // Task suggestions derived from recent performance and optional follower delta
   app.get("/api/tasks", async (req: Request, res: Response) => {
     const userId = (req.query.userId as string) || "";
-    const followerDelta = Number((req.query.followerDelta as string) || 0);
+    // Auto compute deltas from snapshots if available
+    const snaps = await prisma.tikTokSnapshot.findMany({ where: { userId }, orderBy: { capturedAt: "desc" }, take: 90 });
+    const latest = snaps[0]?.followerCount ?? null;
+    const dayAgo = snaps.find((s: any) => (Date.now() - new Date(s.capturedAt).getTime()) >= 24*60*60*1000)?.followerCount ?? latest;
+    const weekAgo = snaps.find((s: any) => (Date.now() - new Date(s.capturedAt).getTime()) >= 7*24*60*60*1000)?.followerCount ?? latest;
+    const monthAgo = snaps.find((s: any) => (Date.now() - new Date(s.capturedAt).getTime()) >= 30*24*60*60*1000)?.followerCount ?? latest;
+    const followerDeltaDay = latest !== null && dayAgo !== null ? latest - dayAgo : 0;
+    const followerDeltaWeek = latest !== null && weekAgo !== null ? latest - weekAgo : 0;
+    const followerDeltaMonth = latest !== null && monthAgo !== null ? latest - monthAgo : 0;
     const acct = await prisma.tikTokAccount.findFirst({ where: { userId }, orderBy: { updatedAt: "desc" } });
     if (!acct) return res.status(404).json({ error: "Not connected" });
     if (!TIKTOK_CLIENT_ID || !TIKTOK_CLIENT_SECRET) {
@@ -574,18 +590,73 @@ function registerTikTokAuth() {
 
       // Build tasks
       const tasks: Array<{id:string; title:string; priority:"high"|"med"|"low"; reason:string; action:string}> = [];
+      // Cadence tasks
       if (cadencePerWeek < 3) tasks.push({ id: "cadence", title: "Post at least 3 times per week", priority: "high", reason: `Current cadence ~${cadencePerWeek}/week`, action: "Batch record 2 sessions (30 min) and schedule" });
+      else if (cadencePerWeek >= 5) tasks.push({ id: "cadence-opt", title: "Keep cadence; add 1 series this week", priority: "low", reason: `Cadence ${cadencePerWeek}/week`, action: "Create a 3‑part series on your best theme" });
+
+      // Length tasks
       if (medianDurationSec > 35) tasks.push({ id: "length-down", title: "Trim videos toward 20–30s", priority: "med", reason: `Median length ${medianDurationSec}s`, action: "Cut set‑up; show payoff by 5–7s" });
       if (medianDurationSec > 0 && medianDurationSec < 15) tasks.push({ id: "length-up", title: "Add one visual step to increase watch time", priority: "med", reason: `Median ${medianDurationSec}s`, action: "Insert a quick demo between hook and payoff" });
-      if (bestHours.length) tasks.push({ id: "timing", title: `Schedule posts around ${bestHours.map(h=>`${h}:00`).join(', ')}`, priority: "low", reason: "Audience active windows", action: "Use reminders to post at peak hours" });
-      if (followerDelta < 0) tasks.push({ id: "followers-down", title: "Run 3 hook experiments this week", priority: "high", reason: `Followers −${Math.abs(followerDelta)}`, action: "Test question hook, contrarian take, and transformation promise" });
-      if (followerDelta > 0 && followerDelta < 50) tasks.push({ id: "followers-flat", title: "Double‑down on best theme with 2‑part series", priority: "med", reason: `Followers +${followerDelta}`, action: "Re‑use top format and vary topic angle" });
 
-      return res.json({ tasks });
+      // Timing tasks
+      if (bestHours.length) tasks.push({ id: "timing", title: `Schedule posts around ${bestHours.map(h=>`${h}:00`).join(', ')}`, priority: "low", reason: "Audience active windows", action: "Use reminders to post at peak hours" });
+
+      // Performance-based tasks (if we have views/likes)
+      const viewVals = (videos as Array<{views?: number|null}>).map(v => Number(v.views || 0)).filter(n=>n>0).sort((a,b)=>a-b);
+      const p75 = viewVals.length ? viewVals[Math.floor(viewVals.length*0.75)] : 0;
+      const winners = p75 ? (videos as Array<{views?: number|null}>).filter(v => (v.views||0) >= p75) : [];
+      if (winners.length) tasks.push({ id: "double-down", title: "Double‑down on winning theme", priority: "high", reason: `${winners.length} recent posts ≥ 75th percentile views`, action: "Make a 2‑part follow‑up with a sharper hook" });
+
+      // Follower trend tasks
+      if (followerDeltaWeek < 0) tasks.push({ id: "followers-down", title: "Run 3 hook experiments this week", priority: "high", reason: `Followers −${Math.abs(followerDeltaWeek)} (7d)`, action: "Test question hook, contrarian take, and transformation promise" });
+      if (followerDeltaWeek > 0 && followerDeltaWeek < 50) tasks.push({ id: "followers-flat", title: "Double‑down on best theme with 2‑part series", priority: "med", reason: `Followers +${followerDeltaWeek} (7d)`, action: "Re‑use top format and vary topic angle" });
+
+      return res.json({ tasks, deltas: { day: followerDeltaDay, week: followerDeltaWeek, month: followerDeltaMonth } });
     } catch (e) {
       console.error("[tasks] error", e);
       return res.status(500).json({ error: "unexpected" });
     }
+  });
+
+  // Trends stub: return niche-based hashtags and sounds for inspiration
+  app.get("/api/trends", async (req: Request, res: Response) => {
+    const niche = String((req.query.niche as string) || "General");
+    const today = new Date().toISOString().slice(0, 10);
+
+    const BASE: Record<string, { hashtags: string[]; sounds: Array<{ title: string; url?: string }> }> = {
+      Parenting: {
+        hashtags: ["parentingtips", "toddlers", "momtok", "dadsoftiktok", "bedtimeroutine"],
+        sounds: [
+          { title: "Calm bedtime piano loop" },
+          { title: "Daily routine trending beat" },
+        ],
+      },
+      Fitness: {
+        hashtags: ["fitness", "gymtok", "wellness", "legday", "formcheck"],
+        sounds: [
+          { title: "Upbeat HIIT 120bpm" },
+          { title: "Motivation chorus clip" },
+        ],
+      },
+      General: {
+        hashtags: ["fyp", "learnontiktok", "howto", "tips", "behindthescenes"],
+        sounds: [
+          { title: "Chill vlog background" },
+          { title: "Quick cuts percussion" },
+        ],
+      },
+    };
+
+    const data = BASE[niche] || BASE.General;
+    const makeScored = (arr: string[]) => arr.map((t, i) => ({ tag: `#${t}`, score: 100 - i * 7 }));
+    const makeSoundScored = (arr: Array<{ title: string; url?: string }>) => arr.map((s, i) => ({ ...s, score: 100 - i * 8 }));
+
+    res.json({
+      date: today,
+      niche,
+      hashtags: makeScored(data.hashtags),
+      sounds: makeSoundScored(data.sounds),
+    });
   });
 }
 
