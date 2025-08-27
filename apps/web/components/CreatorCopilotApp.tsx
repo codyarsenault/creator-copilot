@@ -267,6 +267,9 @@ export default function CreatorCopilotApp() {
   const [tasksError, setTasksError] = useState<string | null>(null);
   const [trends, setTrends] = useState<{ hashtags: TrendItem[]; sounds: TrendItem[]; date?: string } | null>(null);
   const [trendsLoading, setTrendsLoading] = useState<boolean>(false);
+  const [analysis, setAnalysis] = useState<{ durationSec: number; cuts: number; avgCutSec: number; suggestions: string[] } | null>(null);
+  const [uploading, setUploading] = useState<boolean>(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   const activeNiche = customNiche.trim() || niche;
 
@@ -420,6 +423,37 @@ TIPS:
       setTrends(null);
     } finally {
       setTrendsLoading(false);
+    }
+  };
+
+  const onAnalyzeVideo = async (file: File) => {
+    if (!file || !serverUrl) return;
+    setUploadError(null);
+    setUploading(true);
+    try {
+      const headers: Record<string, string> = {};
+      if (/ngrok/.test(serverUrl)) headers['ngrok-skip-browser-warning'] = 'true';
+      const token = await ensureDevToken();
+      const fd = new FormData();
+      fd.append('video', file);
+      fd.append('niche', activeNiche);
+      fd.append('tone', tone);
+      fd.append('goals', goals.join(','));
+      fd.append('pillars', pillars.join(','));
+      if (token) fd.append('userId', token);
+      const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/video/analyze`, { method: 'POST', headers, body: fd as any });
+      const data = await res.json();
+      if (res.ok && typeof data?.durationSec === 'number') {
+        setAnalysis({ durationSec: data.durationSec, cuts: data.cuts, avgCutSec: data.avgCutSec, suggestions: data.suggestions || [] });
+      } else {
+        setAnalysis(null);
+        setUploadError(data?.error ? String(data.error) : `Upload failed (${res.status})`);
+      }
+    } catch (e) {
+      setAnalysis(null);
+      setUploadError('Upload failed');
+    } finally {
+      setUploading(false);
     }
   };
 
@@ -670,30 +704,49 @@ TIPS:
         {/* Video feedback */}
         <section className="mt-6 grid lg:grid-cols-2 gap-5">
           <div className="rounded-2xl border p-4 bg-white/70">
-            <h3 className="font-semibold mb-2 flex items-center gap-2"><VideoIcon size={18} /> Quick video feedback (simulator)</h3>
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <label className="flex flex-col">
-                <span className="text-xs text-gray-600">Length (seconds)</span>
-                <input type="number" min={5} max={120} value={vf.length} onChange={(e) => setVf({ ...vf, length: Number(e.target.value) })} className="mt-1 px-3 py-2 rounded-xl border bg-white" />
-              </label>
-              <label className="flex flex-col">
-                <span className="text-xs text-gray-600">First on‑screen text shown by… (sec)</span>
-                <input type="number" min={0} max={10} value={vf.firstTextSec} onChange={(e) => setVf({ ...vf, firstTextSec: Number(e.target.value) })} className="mt-1 px-3 py-2 rounded-xl border bg-white" />
-              </label>
-              <label className="flex items-center gap-2 mt-1">
-                <input type="checkbox" checked={vf.captions} onChange={(e) => setVf({ ...vf, captions: e.target.checked })} />
-                <span>Captions enabled</span>
-              </label>
-              <label className="flex items-center gap-2 mt-1">
-                <input type="checkbox" checked={vf.trendingSound} onChange={(e) => setVf({ ...vf, trendingSound: e.target.checked })} />
-                <span>Using trending sound</span>
-              </label>
-              <label className="flex flex-col col-span-2">
-                <span className="text-xs text-gray-600">Number of cuts/transitions</span>
-                <input type="number" min={0} max={60} value={vf.cuts} onChange={(e) => setVf({ ...vf, cuts: Number(e.target.value) })} className="mt-1 px-3 py-2 rounded-xl border bg-white" />
-              </label>
+            <h3 className="font-semibold mb-2 flex items-center gap-2"><VideoIcon size={18} /> Video feedback</h3>
+            <div className="text-sm">
+              <input type="file" accept="video/mp4,video/quicktime" onChange={(e)=>{ const f=e.target.files?.[0]; if (f) onAnalyzeVideo(f); }} />
+              {uploading ? <p className="text-xs text-gray-600 mt-2">Analyzing…</p> : null}
+              {uploadError ? <p className="text-xs text-amber-700 mt-2">{uploadError}</p> : null}
+              {analysis ? (
+                <div className="mt-3 text-sm">
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <span className="px-2 py-1 rounded-lg border">Duration: {analysis.durationSec}s</span>
+                    <span className="px-2 py-1 rounded-lg border">Cuts: {analysis.cuts}</span>
+                    <span className="px-2 py-1 rounded-lg border">Avg cut: {analysis.avgCutSec}s</span>
+                  </div>
+                  {'hookText' in analysis ? (
+                    <div className="mt-2 text-xs"><span className="font-medium">Hook text:</span> {(analysis as any).hookText || '—'}</div>
+                  ) : null}
+                  {'captionsPresent' in analysis ? (
+                    <div className="mt-1 text-xs">Captions detected: {(analysis as any).captionsPresent ? 'Yes' : 'No'}</div>
+                  ) : null}
+                  {'transcript' in analysis && (analysis as any).transcript ? (
+                    <details className="mt-2 text-xs">
+                      <summary className="cursor-pointer select-none">Transcript</summary>
+                      <div className="mt-1 whitespace-pre-wrap text-gray-700">{(analysis as any).transcript}</div>
+                    </details>
+                  ) : null}
+                  <div className="mt-2">
+                    <div className="font-medium">Suggestions</div>
+                    <ul className="list-disc pl-5 mt-1 space-y-1">
+                      {analysis.suggestions.map((s,i)=>(<li key={i}>{s}</li>))}
+                    </ul>
+                  </div>
+                  {'critique' in analysis && Array.isArray((analysis as any).critique) ? (
+                    <div className="mt-2">
+                      <div className="font-medium">AI critique</div>
+                      <ul className="list-disc pl-5 mt-1 space-y-1">
+                        {(analysis as any).critique.map((t:string,i:number)=>(<li key={i}>{t}</li>))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500 mt-2">Upload a short video (mp4/mov) to analyze duration and cut pacing.</p>
+              )}
             </div>
-            <p className="text-xs text-gray-500 mt-3 flex items-center gap-1"><AlertTriangle size={14}/> This is a local simulator. In a real build, you’d upload a video and run server‑side analysis (captions, cut detection, hook frames).</p>
           </div>
 
           <div className="rounded-2xl border p-4 bg-white/70">

@@ -4,12 +4,33 @@ import cors from "cors";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import OpenAI from "openai";
+import multer from "multer";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegStatic from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
+import Tesseract from "tesseract.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const prisma = new PrismaClient();
 const app = express();
 
 app.use(cors({ origin: true }));
 app.use(express.json());
+// Configure ffmpeg binaries
+// @ts-ignore
+ffmpeg.setFfmpegPath(ffmpegStatic as any);
+// @ts-ignore
+ffmpeg.setFfprobePath((ffprobeStatic as any)?.path);
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, os.tmpdir()),
+    filename: (_req, file, cb) => cb(null, `upload-${Date.now()}-${Math.random().toString(36).slice(2)}${path.extname(file.originalname) || '.mp4'}`)
+  }),
+  limits: { fileSize: (parseInt(process.env.MAX_UPLOAD_MB || "200", 10)) * 1024 * 1024 }
+});
 
 app.get("/health", (_req: Request, res: Response) => res.json({ ok: true }));
 
@@ -657,6 +678,262 @@ function registerTikTokAuth() {
       hashtags: makeScored(data.hashtags),
       sounds: makeSoundScored(data.sounds),
     });
+  });
+
+  // Video analysis: accept a short mp4/mov, return length and naive cut estimates
+  app.post("/api/video/analyze", upload.single("video"), async (req: Request, res: Response) => {
+    try {
+      const file = (req as any).file as any;
+      if (!file) return res.status(400).json({ error: "missing_file" });
+      const niche = String((req.body?.niche as string) || 'General');
+      const tone = String((req.body?.tone as string) || 'Relatable');
+      const goals = String((req.body?.goals as string) || '').split(',').filter(Boolean);
+      const pillars = String((req.body?.pillars as string) || '').split(',').filter(Boolean);
+      // Working directory for intermediate files
+      const workDir = await (await import("node:fs/promises")).mkdtemp(path.join(os.tmpdir(), "vid-"));
+      // Input path: from multer disk storage or memory buffer fallback
+      let inputPath = (file && file.path) ? file.path : path.join(workDir, "upload.mp4");
+      if (!file.path && file.buffer) {
+        await (await import("node:fs/promises")).writeFile(inputPath, file.buffer);
+      }
+
+      // Probe duration and stream info
+      const probe = await new Promise<any>((resolve, reject) => {
+        ffmpeg.ffprobe(inputPath, (err: any, data: any) => err ? reject(err) : resolve(data));
+      });
+      const durationSec = Math.round(Number(probe?.format?.duration || 0));
+
+      // Scene change detection helper
+      async function detectCuts(threshold: number): Promise<number[]> {
+        return await new Promise((resolve) => {
+          const times: number[] = [];
+          ffmpeg(inputPath)
+            .outputOptions([
+              '-v', 'info',
+              // Downscale for speed, select scene changes, and print pts_time via showinfo
+              '-vf', `scale=320:-1,select=gt(scene\,${threshold}),showinfo`,
+              '-an',
+              '-f', 'null'
+            ])
+            .on('stderr', (line: any) => {
+              // showinfo prints ... pts_time:X ...
+              let m = line.match(/pts_time:([0-9\.]+)/);
+              if (m) times.push(Number(m[1]));
+              // metadata=print alternative: lavfi.scene_score with n: and pts_time sometimes
+              const m2 = line.match(/scene_score=([0-9\.]+)/);
+              const t2 = line.match(/pts_time:([0-9\.]+)/);
+              if (m2 && t2) times.push(Number(t2[1]));
+            })
+            .on('end', () => resolve(times))
+            .on('error', () => resolve(times))
+            .saveToFile('/dev/null');
+        });
+      }
+      // First pass (stricter), second pass (looser) if needed
+      let cutTimestamps: number[] = await detectCuts(0.32);
+      if (cutTimestamps.length === 0) {
+        const loose = await detectCuts(0.15);
+        cutTimestamps = Array.from(new Set([...cutTimestamps, ...loose])).sort((a,b)=>a-b);
+      }
+
+      // Silence/beat detection: use ffmpeg to extract silent segments
+      const silences: Array<{start:number; end:number}> = await new Promise((resolve) => {
+        const out: Array<{start:number; end:number}> = [];
+        ffmpeg(inputPath)
+          .outputOptions(['-af', 'silencedetect=noise=-30dB:d=0.3', '-f', 'null'])
+          .on('stderr', (line: any) => {
+            let m = line.match(/silence_start: ([0-9\.]+)/);
+            if (m) out.push({ start: Number(m[1]), end: Number(m[1]) });
+            m = line.match(/silence_end: ([0-9\.]+) \|/);
+            if (m && out.length) out[out.length-1].end = Number(m[1]);
+          })
+          .on('end', () => resolve(out))
+          .on('error', () => resolve(out))
+          .saveToFile('/dev/null');
+      });
+
+      // OCR first frame(s) to detect hook text timing
+      const firstFramePath = `${workDir}/firstframe.jpg`;
+      await new Promise((resolve) => {
+        ffmpeg(inputPath).screenshots({ timestamps: [0.0, 0.5, 1.0], filename: 'frame-at-%s.jpg', folder: workDir, size: '720x?' })
+          .on('end', resolve)
+          .on('error', resolve);
+      });
+      let hookText = '';
+      try {
+        const frames = [0, 0.5, 1.0].map(t => `${workDir}/frame-at-${t}.jpg`);
+        for (const f of frames) {
+          const resOcr: any = await Tesseract.recognize(f, 'eng');
+          const text = (resOcr?.data?.text || '').trim();
+          if (text) { hookText = text.replace(/\s+/g, ' ').slice(0, 80); break; }
+        }
+      } catch {}
+
+      // Caption presence check (SRT/VTT not supported yet on upload). Approximate by OCR lower third
+      const captionsPresent = !!hookText;
+
+      await (await import("node:fs/promises")).rm(workDir, { recursive: true, force: true });
+      if (file && file.path) { try { await (await import("node:fs/promises")).unlink(file.path); } catch {} }
+
+      // Compute naive metrics
+      // Fallback: if scene detection found nothing, approximate cuts from silence boundaries
+      let cuts = cutTimestamps.length;
+      if (cuts === 0 && silences.length > 1) {
+        const gaps = silences.filter(s => (s.end - s.start) >= 0.25).length;
+        cuts = Math.max(0, gaps - 1);
+      }
+      // Second fallback: sample frames and compare file size deltas as a proxy for visual change
+      if (cuts === 0) {
+        await new Promise((resolve) => {
+          ffmpeg(inputPath)
+            .outputOptions(['-vf', 'fps=4,scale=320:-1', '-qscale:v', '3'])
+            .save(path.join(workDir, 'cut-sample-%03d.jpg'))
+            .on('end', resolve)
+            .on('error', resolve);
+        });
+        try {
+          const files = (await (await import('node:fs/promises')).readdir(workDir))
+            .filter(n => n.startsWith('cut-sample-') && n.endsWith('.jpg'))
+            .sort();
+          const stats = await Promise.all(files.map(async f => (await (await import('node:fs/promises')).stat(path.join(workDir, f))).size));
+          let inferredCuts = 0;
+          for (let i = 1; i < stats.length; i++) {
+            const a = stats[i-1];
+            const b = stats[i];
+            if (a === 0 || b === 0) continue;
+            const diff = Math.abs(b - a) / Math.max(a, b);
+            if (diff >= 0.15) inferredCuts++;
+          }
+          if (inferredCuts > 0) {
+            cuts = inferredCuts;
+            cutTimestamps = [];
+          }
+        } catch {}
+      }
+      const avgCutSec = cuts > 1 ? Math.round((durationSec / cuts) * 10) / 10 : durationSec;
+      // Estimate first voiced moment from silences
+      const firstSilence = silences.find(s => s.start <= 0.05);
+      const firstSoundSec = firstSilence && firstSilence.end ? firstSilence.end : 0;
+
+      // Optional speech transcription (Whisper) for richer analysis
+      let transcript: string | undefined = undefined;
+      let segments: Array<{ start: number; end: number; text: string }> | undefined = undefined;
+      try {
+        if (openai) {
+          const audioPath = `${workDir}/audio.wav`;
+          await new Promise((resolve) => {
+            ffmpeg(inputPath)
+              .outputOptions(['-vn','-acodec','pcm_s16le','-ar','16000','-ac','1'])
+              .save(audioPath)
+              .on('end', resolve)
+              .on('error', resolve);
+          });
+          // @ts-ignore - openai types accept Readable
+          const tr = await openai.audio.transcriptions.create({
+            model: process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1',
+            // @ts-ignore
+            file: fs.createReadStream(audioPath),
+            response_format: 'verbose_json'
+          } as any);
+          transcript = (tr as any)?.text || undefined;
+          segments = Array.isArray((tr as any)?.segments) ? (tr as any).segments.map((s:any)=>({ start: Number(s.start||0), end: Number(s.end||0), text: String(s.text||'') })) : undefined;
+        }
+      } catch {}
+
+      // Derived metrics from transcript/segments and silences
+      let first2sText = '';
+      let speechSeconds = 0;
+      if (segments && segments.length) {
+        first2sText = segments.filter(s => s.start < 2).map(s => s.text).join(' ').trim();
+        speechSeconds = segments.reduce((acc, s) => acc + Math.max(0, Number(s.end) - Number(s.start)), 0);
+      }
+      const wordsTotal = (transcript || '').trim().split(/\s+/).filter(Boolean).length;
+      const wordsPerSec = speechSeconds > 0 ? Number((wordsTotal / speechSeconds).toFixed(2)) : undefined;
+      const first3Cuts = cutTimestamps.filter(t => t <= 3).length;
+      const silenceRatio = silences.reduce((acc, s) => acc + Math.max(0, (s.end - s.start)), 0) / Math.max(1, durationSec);
+
+      // Audio loudness
+      let meanDb: number | undefined = undefined;
+      let maxDb: number | undefined = undefined;
+      await new Promise((resolve) => {
+        ffmpeg(inputPath)
+          .outputOptions(['-af', 'volumedetect', '-f', 'null'])
+          .on('stderr', (line: any) => {
+            let m = line.match(/mean_volume:\s*(-?[0-9\.]+) dB/);
+            if (m) meanDb = Number(m[1]);
+            m = line.match(/max_volume:\s*(-?[0-9\.]+) dB/);
+            if (m) maxDb = Number(m[1]);
+          })
+          .on('end', resolve)
+          .on('error', resolve)
+          .saveToFile('/dev/null');
+      });
+
+      // First-second brightness/contrast
+      let firstSecondStats: { yavg?: number; ymin?: number; ymax?: number; contrast?: number } = {};
+      await new Promise((resolve) => {
+        const values: number[] = [];
+        ffmpeg(inputPath)
+          .outputOptions(['-t', '1.2', '-vf', 'scale=320:-1,signalstats', '-f', 'null'])
+          .on('stderr', (line: any) => {
+            const ya = line.match(/YAVG:([0-9\.]+)/);
+            if (ya) values.push(Number(ya[1]));
+            const ymi = line.match(/YMIN:([0-9]+)/);
+            const yma = line.match(/YMAX:([0-9]+)/);
+            if (ymi) firstSecondStats.ymin = Number(ymi[1]);
+            if (yma) firstSecondStats.ymax = Number(yma[1]);
+          })
+          .on('end', () => { if (values.length) firstSecondStats.yavg = Math.round((values.reduce((a,b)=>a+b,0)/values.length)); if (firstSecondStats.ymin!=null && firstSecondStats.ymax!=null) firstSecondStats.contrast = Number((firstSecondStats.ymax - firstSecondStats.ymin).toFixed(0)); resolve(null); })
+          .on('error', () => resolve(null))
+          .saveToFile('/dev/null');
+      });
+
+      // Dynamic suggestions via LLM only (no fallback)
+      if (!openai) return res.status(503).json({ error: "llm_unavailable" });
+      let suggestions: string[] = [];
+      try {
+        const keywords = transcript ? (transcript.toLowerCase().match(/\b[a-z]{4,}\b/g) || []).reduce((m:any,w:string)=>{m[w]=(m[w]||0)+1;return m;}, {}) : {};
+        const topKw = Object.entries(keywords).sort((a:any,b:any)=>b[1]-a[1]).slice(0,8).map(([w,c])=>`${w}(${c})`).join(', ');
+        const promptSug = `You are a professional short‑form video editor coaching a ${niche} creator. Voice: ${tone}. Goals: ${goals.join(', ') || 'audience growth'}. Pillars: ${pillars.join(', ') || '—'}.\n\nTask: Propose 5 EDITING changes only (not topics, hooks, captions, or content ideas). Each must be specific to the given metrics and under 14 words. Use imperative verbs.\nForbidden: suggesting new content topics, hooks like “Busting the myth…”, generic advice, or duplicating tips.\nOutput (JSON): {"suggestions":[{"area":"hook|pacing|clarity|audio|captions|visual","tip":"…","why":"…","severity":"high|med|low"}],"notes":"optional short note"}.\n\nMetrics:\nDuration:${durationSec}s\nCuts:${cuts} (first3:${first3Cuts})\nAvgCut:${avgCutSec}s\nSilenceRatio:${(silenceRatio*100).toFixed(1)}%\nFirstSound:${firstSoundSec}s\nHookText:${hookText || '—'}\nFirst2sText:${first2sText || '—'}\nCaptions:${captionsPresent}\nLoudness mean:${meanDb ?? 'n/a'}dB max:${maxDb ?? 'n/a'}dB\nWordsPerSec:${wordsPerSec ?? 'n/a'}\nFirstSecond YAVG:${firstSecondStats.yavg ?? 'n/a'} YMIN:${firstSecondStats.ymin ?? 'n/a'} YMAX:${firstSecondStats.ymax ?? 'n/a'} Contrast:${firstSecondStats.contrast ?? 'n/a'}\nTranscriptKeywords:${topKw}`;
+        const comp = await openai.chat.completions.create({
+          model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: 'You return strict JSON and act as a video editing coach. Never propose topics; only editing changes.' },
+            { role: 'user', content: promptSug }
+          ],
+          temperature: 0.6,
+          response_format: { type: 'json_object' }
+        });
+        const text = comp.choices?.[0]?.message?.content?.trim() || '';
+        let raw = text;
+        const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+        if (fenced) raw = fenced[1].trim();
+        let parsed: any = {};
+        try { parsed = JSON.parse(raw); } catch {}
+        if (Array.isArray(parsed?.suggestions)) {
+          // accept either strings or objects
+          suggestions = parsed.suggestions.slice(0,5).map((s:any)=> typeof s === 'string' ? s : (s?.tip || '')).filter(Boolean);
+        }
+      } catch (e) {
+        return res.status(502).json({ error: "llm_failed" });
+      }
+
+      // Optional LLM critique if configured
+      let critique: string[] | undefined = undefined;
+      try {
+        const prompt = `Give 5 short, specific improvement suggestions for a short-form video. Keep each under 15 words.\n\nMetrics:\nDuration: ${durationSec}s\nCuts: ${cuts}\nAvg cut: ${avgCutSec}s\nHook text: ${hookText || '—'}\nSilences: ${silences.length}\nCaptions present: ${captionsPresent}`;
+        const completion = await openai.chat.completions.create({
+          model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.5,
+        });
+        critique = completion.choices?.[0]?.message?.content?.split(/\n|\r/).map(s=>s.trim()).filter(Boolean).slice(0,5);
+      } catch {}
+
+      res.json({ durationSec, cuts, avgCutSec, cutTimeline: cutTimestamps, first3Cuts, hookText, first2sText, captionsPresent, silences, silenceRatio, loudness: { meanDb, maxDb }, firstSecond: firstSecondStats, wordsPerSec, transcript, suggestions, critique });
+    } catch (e) {
+      res.status(500).json({ error: "analysis_failed" });
+    }
   });
 }
 
